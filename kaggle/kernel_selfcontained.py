@@ -4,7 +4,7 @@
 import json, os, re, subprocess, tempfile, time, urllib.request
 
 # ----------------------------- config (edit repo IDs if needed) ---------------
-PHI4_REPO = os.environ.get("PHI4_REPO", "inferless/phi-4-GGUF")
+PHI4_REPO = os.environ.get("PHI4_REPO", "bartowski/phi-4-GGUF")  # full-weights repo has no GGUF
 QWY_REPO  = os.environ.get("QWY_REPO",  "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF")
 QUANT     = os.environ.get("TD_QUANT", "Q4_K_M")
 
@@ -16,16 +16,24 @@ from huggingface_hub import hf_hub_download, list_repo_files
 
 def resolve_gguf(repo):
     files = [f for f in list_repo_files(repo) if f.lower().endswith(".gguf")]
-    pick = next((f for f in files if QUANT.lower() in f.lower()), files[0] if files else None)
-    if not pick: raise RuntimeError(f"no gguf in {repo}")
+    if not files: raise RuntimeError(f"no gguf in {repo}")
+    # prefer the requested quant; else the alphabetically-first Q4_* ; else just refuse
+    # the giant F16/Q8 (would OOM on a 16GB T4) — fall back to smallest by name heuristic.
+    pick = next((f for f in files if QUANT.lower() in f.lower()), None)
+    if not pick:
+        q4 = [f for f in files if "q4" in f.lower()]
+        pick = sorted(q4)[0] if q4 else sorted(files, key=len)[0]
     print(f"  {repo} -> {pick}", flush=True)
     return hf_hub_download(repo, pick)
 
 LS = "/kaggle/working/llama.cpp/build/bin/llama-server"
 if not os.path.exists(LS):
+    # FindCUDAToolkit can't locate CUDA::cuda_driver on Kaggle (libcuda lives in stubs/ only).
+    sh("ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so")
     sh("cd /kaggle/working && git clone --depth 1 https://github.com/ggerganov/llama.cpp")
     sh("cd /kaggle/working/llama.cpp && cmake -B build -DGGML_CUDA=ON "
        "-DCMAKE_CUDA_ARCHITECTURES=75 && cmake --build build --config Release -j --target llama-server")
+    assert os.path.exists(LS), "llama-server build FAILED (see cmake/link errors above)"
 
 print("resolving GGUFs...", flush=True)
 PHI4 = resolve_gguf(PHI4_REPO); QWY = resolve_gguf(QWY_REPO)
