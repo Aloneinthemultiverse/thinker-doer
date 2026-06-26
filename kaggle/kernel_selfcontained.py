@@ -7,6 +7,9 @@ import json, os, re, subprocess, tempfile, time, urllib.request
 PHI4_REPO = os.environ.get("PHI4_REPO", "bartowski/phi-4-GGUF")  # full-weights repo has no GGUF
 QWY_REPO  = os.environ.get("QWY_REPO",  "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF")
 QUANT     = os.environ.get("TD_QUANT", "Q4_K_M")
+# Kaggle assigns a SINGLE 16GB GPU (P100), not T4x2. To fit both models on one card,
+# run Phi-4 at a smaller quant and keep contexts tiny (tasks are small bug-fixes).
+PHI4_QUANT = os.environ.get("PHI4_QUANT", "Q3_K_M")  # ~7GB vs ~9GB for Q4_K_M
 
 def sh(c): print("$",c,flush=True); return subprocess.run(c,shell=True)
 
@@ -19,23 +22,23 @@ sh("pip -q install 'llama-cpp-python[server]' "
    "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124")
 from huggingface_hub import hf_hub_download, list_repo_files
 
-def resolve_gguf(repo):
+def resolve_gguf(repo, quant=QUANT):
     files = [f for f in list_repo_files(repo) if f.lower().endswith(".gguf")]
     if not files: raise RuntimeError(f"no gguf in {repo}")
-    # prefer the requested quant; else the alphabetically-first Q4_* ; else just refuse
-    # the giant F16/Q8 (would OOM on a 16GB T4) — fall back to smallest by name heuristic.
-    pick = next((f for f in files if QUANT.lower() in f.lower()), None)
+    # prefer the requested quant; else any q4/q3; else smallest-named (avoid giant F16/Q8).
+    pick = next((f for f in files if quant.lower() in f.lower()), None)
     if not pick:
-        q4 = [f for f in files if "q4" in f.lower()]
-        pick = sorted(q4)[0] if q4 else sorted(files, key=len)[0]
+        small = [f for f in files if "q4" in f.lower() or "q3" in f.lower()]
+        pick = sorted(small)[0] if small else sorted(files, key=len)[0]
     print(f"  {repo} -> {pick}", flush=True)
     return hf_hub_download(repo, pick)
 
 print("resolving GGUFs...", flush=True)
-PHI4 = resolve_gguf(PHI4_REPO); QWY = resolve_gguf(QWY_REPO)
+PHI4 = resolve_gguf(PHI4_REPO, PHI4_QUANT); QWY = resolve_gguf(QWY_REPO)
 
-# ----------------------------- 2. serve both, one per GPU ---------------------
-# llama_cpp.server is OpenAI-compatible (/v1/chat/completions). One process per GPU.
+# ----------------------------- 2. serve both ----------------------------------
+# llama_cpp.server is OpenAI-compatible (/v1/chat/completions). Kaggle gives ONE 16GB
+# GPU, so both share it; keep contexts small so the two KV caches fit alongside weights.
 try: NG=int(subprocess.run("nvidia-smi -L",shell=True,capture_output=True,text=True).stdout.count("GPU "))
 except Exception: NG=1
 g_qwy = "1" if NG>=2 else "0"; print(f"GPUs={NG} -> qwythos on cuda{g_qwy}, phi4 on cuda0",flush=True)
@@ -44,8 +47,10 @@ def serve(gpu, gguf, port, ctx):
     return subprocess.Popen(["python","-m","llama_cpp.server","--model",gguf,
         "--host","0.0.0.0","--port",str(port),"--n_gpu_layers","-1",
         "--n_ctx",str(ctx)], env=env)
-serve(g_qwy, QWY, 8080, 32768)
-serve("0", PHI4, 8081, 16384)
+QCTX = int(os.environ.get("TD_QCTX", "4096" if NG<2 else "32768"))
+PCTX = int(os.environ.get("TD_PCTX", "4096" if NG<2 else "16384"))
+serve(g_qwy, QWY, 8080, QCTX)
+serve("0", PHI4, 8081, PCTX)
 for port in (8080, 8081):
     up=False
     for _ in range(180):
