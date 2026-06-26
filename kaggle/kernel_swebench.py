@@ -17,7 +17,8 @@ PHI4_REPO = os.environ.get("PHI4_REPO", "bartowski/phi-4-GGUF")
 QWY_REPO  = os.environ.get("QWY_REPO",  "empero-ai/Qwythos-9B-Claude-Mythos-5-1M-GGUF")
 QUANT     = os.environ.get("TD_QUANT", "Q4_K_M")
 PHI4_QUANT= os.environ.get("PHI4_QUANT", "Q4_K_M")
-N_INST    = int(os.environ.get("TD_N", "25"))     # SWE-bench Lite slice size
+START     = int(os.environ.get("TD_START", "0"))  # chunk offset: 0, 25, 50, ... (edit per run)
+N_INST    = int(os.environ.get("TD_N", "25"))     # SWE-bench Lite chunk size
 MAX_FILES = int(os.environ.get("TD_MAXFILES", "2"))   # localized files to edit per instance
 MAX_LINES = int(os.environ.get("TD_MAXLINES", "800")) # skip rewriting files larger than this
 
@@ -83,8 +84,9 @@ def doer(m,mt=4096):  return _chat(DOER_EP,m,0.2,mt)
 # ----------------------------- 3. SWE-bench Lite data -------------------------
 from datasets import load_dataset
 DS=load_dataset("princeton-nlp/SWE-bench_Lite", split="test")
-INSTANCES=[DS[i] for i in range(min(N_INST,len(DS)))]
-print(f"loaded {len(INSTANCES)} SWE-bench Lite instances",flush=True)
+END=min(START+N_INST,len(DS))
+INSTANCES=[DS[i] for i in range(START,END)]
+print(f"SWE-bench Lite chunk [{START}:{END}] of {len(DS)} -> {len(INSTANCES)} instances",flush=True)
 
 # ----------------------------- 4. repo checkout + localize --------------------
 WORK="/kaggle/working/repos"; os.makedirs(WORK,exist_ok=True)
@@ -190,13 +192,14 @@ def run():
         print(f"[{i}/{len(INSTANCES)}] {iid:<28} files={len(files)} "
               f"couple={'Y' if cp.strip() else '-'} solo={'Y' if sp.strip() else '-'} "
               f"{time.time()-t0:.0f}s",flush=True)
-    json.dump(couple_preds, open("/kaggle/working/preds_couple.json","w"))
-    json.dump(solo_preds,   open("/kaggle/working/preds_solo.json","w"))
+    cfile=f"/kaggle/working/preds_couple_{START}_{END}.json"
+    sfile=f"/kaggle/working/preds_solo_{START}_{END}.json"
+    json.dump(couple_preds, open(cfile,"w")); json.dump(solo_preds, open(sfile,"w"))
     nc=sum(1 for p in couple_preds if p["model_patch"].strip())
     ns=sum(1 for p in solo_preds   if p["model_patch"].strip())
-    print(f"\nwrote preds_couple.json ({nc} non-empty) + preds_solo.json ({ns} non-empty)")
-    print("SUBMIT (locally, with your SWEBENCH_API_KEY set):")
-    print("  sb-cli submit swe-bench_lite test --predictions_path preds_couple.json --run_id td_couple")
-    print("  sb-cli submit swe-bench_lite test --predictions_path preds_solo.json   --run_id td_solo")
+    print(f"\nwrote {os.path.basename(cfile)} ({nc} non-empty) + {os.path.basename(sfile)} ({ns} non-empty)")
+    print(f"NEXT CHUNK: set TD_START={END} and re-run.  After all chunks: merge the JSON lists and submit:")
+    print("  sb-cli submit swe-bench_lite test --predictions_path preds_couple_ALL.json --run_id td_couple")
+    print("  sb-cli submit swe-bench_lite test --predictions_path preds_solo_ALL.json   --run_id td_solo")
 
 run()
