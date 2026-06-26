@@ -10,8 +10,13 @@ QUANT     = os.environ.get("TD_QUANT", "Q4_K_M")
 
 def sh(c): print("$",c,flush=True); return subprocess.run(c,shell=True)
 
-# ----------------------------- 1. deps + llama.cpp ----------------------------
+# ----------------------------- 1. deps (prebuilt CUDA wheel — no compile) ------
+# Building llama.cpp from source on Kaggle fails: FindCUDAToolkit can't create the
+# CUDA::cuda_driver target (libcuda is stub-only). Use the prebuilt llama-cpp-python
+# CUDA 12.x wheel instead — it ships a precompiled server, zero compilation.
 sh("pip -q install huggingface_hub")
+sh("pip -q install 'llama-cpp-python[server]' "
+   "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124")
 from huggingface_hub import hf_hub_download, list_repo_files
 
 def resolve_gguf(repo):
@@ -26,24 +31,21 @@ def resolve_gguf(repo):
     print(f"  {repo} -> {pick}", flush=True)
     return hf_hub_download(repo, pick)
 
-LS = "/kaggle/working/llama.cpp/build/bin/llama-server"
-if not os.path.exists(LS):
-    # FindCUDAToolkit can't locate CUDA::cuda_driver on Kaggle (libcuda lives in stubs/ only).
-    sh("ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/libcuda.so")
-    sh("cd /kaggle/working && git clone --depth 1 https://github.com/ggerganov/llama.cpp")
-    sh("cd /kaggle/working/llama.cpp && cmake -B build -DGGML_CUDA=ON "
-       "-DCMAKE_CUDA_ARCHITECTURES=75 && cmake --build build --config Release -j --target llama-server")
-    assert os.path.exists(LS), "llama-server build FAILED (see cmake/link errors above)"
-
 print("resolving GGUFs...", flush=True)
 PHI4 = resolve_gguf(PHI4_REPO); QWY = resolve_gguf(QWY_REPO)
 
 # ----------------------------- 2. serve both, one per GPU ---------------------
+# llama_cpp.server is OpenAI-compatible (/v1/chat/completions). One process per GPU.
 try: NG=int(subprocess.run("nvidia-smi -L",shell=True,capture_output=True,text=True).stdout.count("GPU "))
 except Exception: NG=1
 g_qwy = "1" if NG>=2 else "0"; print(f"GPUs={NG} -> qwythos on cuda{g_qwy}, phi4 on cuda0",flush=True)
-subprocess.Popen(f"CUDA_VISIBLE_DEVICES={g_qwy} {LS} -m {QWY} --host 0.0.0.0 --port 8080 -ngl 99 -c 32768 --parallel 1", shell=True)
-subprocess.Popen(f"CUDA_VISIBLE_DEVICES=0 {LS} -m {PHI4} --host 0.0.0.0 --port 8081 -ngl 99 -c 16384 --parallel 1", shell=True)
+def serve(gpu, gguf, port, ctx):
+    env=dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+    return subprocess.Popen(["python","-m","llama_cpp.server","--model",gguf,
+        "--host","0.0.0.0","--port",str(port),"--n_gpu_layers","-1",
+        "--n_ctx",str(ctx)], env=env)
+serve(g_qwy, QWY, 8080, 32768)
+serve("0", PHI4, 8081, 16384)
 for port in (8080, 8081):
     up=False
     for _ in range(180):
