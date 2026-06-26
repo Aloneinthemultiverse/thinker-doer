@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.gguf
+*.safetensors
+.venv/
+kaggle_out/
+td_*/
