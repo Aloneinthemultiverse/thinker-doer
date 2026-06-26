@@ -44,9 +44,11 @@ except Exception: NG=1
 g_qwy = "1" if NG>=2 else "0"; print(f"GPUs={NG} -> qwythos on cuda{g_qwy}, phi4 on cuda0",flush=True)
 def serve(gpu, gguf, port, ctx):
     env=dict(os.environ, CUDA_VISIBLE_DEVICES=gpu)
+    # small batch -> small compute-graph buffer; prior run OOM'd in graph_compute at batch 512
+    # on the single 16GB GPU even though weights+KV fit.
     return subprocess.Popen(["python","-m","llama_cpp.server","--model",gguf,
         "--host","0.0.0.0","--port",str(port),"--n_gpu_layers","-1",
-        "--n_ctx",str(ctx)], env=env)
+        "--n_ctx",str(ctx),"--n_batch","64","--n_ubatch","64"], env=env)
 QCTX = int(os.environ.get("TD_QCTX", "4096" if NG<2 else "32768"))
 PCTX = int(os.environ.get("TD_PCTX", "4096" if NG<2 else "16384"))
 serve(g_qwy, QWY, 8080, QCTX)
