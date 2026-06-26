@@ -139,16 +139,39 @@ def solve_one(p, couple):
     return ok,used
 
 # ----------------------------- 7. run both ------------------------------------
+# Checkpoint each result so a restart resumes instead of starting over. Persists to
+# /kaggle/working (kept as the kernel's output); re-add that output as input to resume
+# across separate runs. Within a session it also guards against mid-run hiccups.
+CKPT="/kaggle/working/he_ckpt.jsonl"
+def _load_ckpt():
+    done={}
+    if os.path.exists(CKPT):
+        for ln in open(CKPT,encoding="utf-8"):
+            ln=ln.strip()
+            if ln: r=json.loads(ln); done[(r["mode"],r["task_id"])]=r
+    return done
+def _save_ckpt(rec):
+    with open(CKPT,"a",encoding="utf-8") as f: f.write(json.dumps(rec)+"\n")
+
 def run(couple):
+    mode="couple" if couple else "solo"
     label="COUPLE (Phi-4 plans -> Qwythos)" if couple else "DOER-SOLO (Qwythos)"
     print(f"\n========== {label} ==========",flush=True)
-    passed=saves=0; t0=time.time()
+    done=_load_ckpt(); t0=time.time()
     for i,p in enumerate(PROBS,1):
+        tid=p["task_id"]
+        if (mode,tid) in done:
+            r=done[(mode,tid)]
+            print(f"[{i}/{len(PROBS)}] {tid:<14} {'PASS' if r['ok'] else 'FAIL'} (cached)",flush=True)
+            continue
         try: ok,used=solve_one(p,couple)
         except Exception as e: ok,used=False,False; print("  err",str(e)[:60])
-        passed+=ok; saves+=ok and used
-        print(f"[{i}/{len(PROBS)}] {p['task_id']:<14} {'PASS' if ok else 'FAIL'}"
+        _save_ckpt({"mode":mode,"task_id":tid,"ok":bool(ok),"used":bool(used)})
+        print(f"[{i}/{len(PROBS)}] {tid:<14} {'PASS' if ok else 'FAIL'}"
               f"{' (saved by retry)' if ok and used else ''}",flush=True)
+    done=_load_ckpt()
+    recs=[done[(mode,p["task_id"])] for p in PROBS if (mode,p["task_id"]) in done]
+    passed=sum(r["ok"] for r in recs); saves=sum(r["ok"] and r["used"] for r in recs)
     pct=100*passed/len(PROBS)
     print(f"\n{label} pass@1: {passed}/{len(PROBS)} = {pct:.1f}%  "
           f"(retry rescued {saves}, {time.time()-t0:.0f}s)\n",flush=True)
