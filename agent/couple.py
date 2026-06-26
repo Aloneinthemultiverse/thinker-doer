@@ -99,6 +99,7 @@ def solve(task, rel="buggy.py", verbose=True):
         return _doer_solo(task, rel, say)
 
     g = Graph()
+    g.add("task", "system", task, ns="shared")
     src = tools.read_file(rel)
     if src.startswith("ERROR"):
         return False, 0, "no-file"
@@ -107,14 +108,22 @@ def solve(task, rel="buggy.py", verbose=True):
 
     for rnd in range(1, MAX_ROUNDS + 1):
         say(f"\n=== round {rnd}/{MAX_ROUNDS} ===")
+        # a failing verifier from the prior round is an objective DOUBT region -> escalate
+        # to the thinker (Phi-4). On round 1 there's no doubt yet; the plan is the entry.
+        if rnd > 1 and failing:
+            g.open_doubt(_hint(failing) or "tests still failing")
         history = g.history(kind="result", k=3) if rnd > 1 else ""
         cot, insight = _think(task, src, failing, history)
-        g.add_node("plan", "thinker", insight)
+        # thinker writes to its private KG, then promotes the plan to the shared blackboard
+        pid = g.add("plan", "thinker", insight, ns="phi4")
+        g.promote(pid, author="thinker")
         say(f"  [thinker] {len(cot)} chars | {insight[:80]}")
 
         passed, body, out = _do(task, cot, src, rel)
-        g.add_node("result", "doer", (out.splitlines() or [""])[0][:140],
-                   payload={"passed": passed})
+        # doer writes its result to its private KG, then commits it to shared
+        rid = g.add("result", "doer", (out.splitlines() or [""])[0][:140],
+                    ns="qwythos", payload={"passed": passed})
+        g.promote(rid, author="doer")
         say(f"  [doer] -> {'PASS' if passed else 'fail'}")
 
         if passed:
