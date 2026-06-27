@@ -131,29 +131,66 @@ def localize(repo_dir, problem):
         if len(keep)>=MAX_FILES: break
     return keep
 
-# ----------------------------- 5. generate fix --------------------------------
-_CODE=re.compile(r"```(?:python)?\s*(.*?)```",re.DOTALL)
-def _block(reply, original):
-    bs=[b for b in _CODE.findall(reply) if "def " in b or "class " in b or "import " in b]
-    return max(bs,key=len).strip()+"\n" if bs else None
+# ----------------------------- 5. generate fix (SEARCH/REPLACE, never destructive) ----
+# The OLD approach asked for a full-file rewrite; the 9B truncated it, so the git diff
+# DELETED the file -> every test errored ("failed run"). Fix: minimal SEARCH/REPLACE edits.
+# The model copies the exact lines to change and their replacement; we splice them in and
+# REJECT the edit unless the result still parses. Worst case = empty patch (unresolved),
+# never a destroyed file (failed run).
+import ast
+_SR=re.compile(r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE", re.DOTALL)
+_FMT=("Respond ONLY with one or more edit blocks in this EXACT format:\n"
+      "<<<<<<< SEARCH\n<lines copied verbatim from the file, including indentation>\n"
+      "=======\n<the replacement lines>\n>>>>>>> REPLACE\n"
+      "Keep SEARCH blocks small (just the lines that change). Copy them EXACTLY.")
+
+def _apply_blocks(src, reply):
+    """Apply each SEARCH/REPLACE block. Exact match first, then trailing-ws-tolerant,
+    then stripped-line span match (handles indentation drift). Returns (new_src, n_applied)."""
+    out=src; applied=0
+    for sm, rep in _SR.findall(reply):
+        s=sm.strip("\n"); r=rep.strip("\n")
+        if not s.strip():
+            continue
+        if s in out:
+            out=out.replace(s, r, 1); applied+=1; continue
+        rstrip=lambda t: "\n".join(l.rstrip() for l in t.split("\n"))
+        if rstrip(s) in rstrip(out):
+            out=rstrip(out).replace(rstrip(s), rstrip(r), 1); applied+=1; continue
+        # span match on stripped lines; re-indent replacement to the matched block's indent
+        ol=out.split("\n"); sl=s.split("\n"); k=len(sl)
+        tgt=[l.strip() for l in sl]; hit=-1
+        for i in range(len(ol)-k+1):
+            if [l.strip() for l in ol[i:i+k]]==tgt: hit=i; break
+        if hit>=0:
+            indent=re.match(r"\s*", ol[hit]).group()
+            rl=[(indent+l if l.strip() else l) for l in r.split("\n")]
+            ol[hit:hit+k]=rl; out="\n".join(ol); applied+=1
+    return out, applied
+
+def _valid_py(code):
+    try: ast.parse(code); return True
+    except Exception: return False
 
 def fix_file(problem, path, src, couple):
+    """Return (new_src, applied) — only an edit that applies AND still parses; else (src,0)."""
     if couple:
-        plan=think([{"role":"system","content":"You are an expert software engineer. Diagnose the "
-                     "root cause from the issue and the file, and state the precise minimal fix. "
-                     "Do not write the whole file."},
+        plan=think([{"role":"system","content":"You are an expert software engineer. From the "
+                     "issue and file, diagnose the root cause and state the precise minimal fix "
+                     "(which lines, what they become). Do not write code blocks."},
                     {"role":"user","content":f"GitHub issue:\n{problem[:4000]}\n\nFile {path}:\n"
-                     f"```python\n{src}\n```\nWhat is the bug and the exact minimal change?"}])
+                     f"```python\n{src[:60000]}\n```\nWhat is the bug and the exact minimal change?"}])
         usr=(f"Issue:\n{problem[:2500]}\n\nExpert diagnosis:\n{plan[-2500:]}\n\nFile {path}:\n"
-             f"```python\n{src}\n```\nReturn the COMPLETE corrected file in one ```python block.")
+             f"```python\n{src[:60000]}\n```\n\n{_FMT}")
     else:
-        usr=(f"GitHub issue:\n{problem[:4000]}\n\nFile {path}:\n```python\n{src}\n```\n"
-             f"Fix the bug described in the issue. Return the COMPLETE corrected file in one "
-             f"```python block.")
-    reply=doer([{"role":"system","content":"You output only the complete corrected file in one "
-                 "```python code block. Preserve everything except the necessary fix."},
-                {"role":"user","content":usr}])
-    return _block(reply, src)
+        usr=(f"GitHub issue:\n{problem[:4000]}\n\nFile {path}:\n```python\n{src[:60000]}\n```\n\n{_FMT}")
+    reply=doer([{"role":"system","content":"You are an expert Python engineer making a minimal "
+                 "bug fix via SEARCH/REPLACE edit blocks. Output only the blocks."},
+                {"role":"user","content":usr}], mt=2048)
+    new, applied=_apply_blocks(src, reply)
+    if applied and new!=src and _valid_py(new):
+        return new, applied
+    return src, 0
 
 def make_patch(repo_dir, problem, files, couple):
     sh(f"cd {repo_dir} && git checkout -q -f .")          # clean slate
@@ -161,8 +198,8 @@ def make_patch(repo_dir, problem, files, couple):
         ap=os.path.join(repo_dir,f)
         try: src=open(ap,encoding="utf-8",errors="ignore").read()
         except OSError: continue
-        new=fix_file(problem, f, src, couple)
-        if new and new.strip()!=src.strip():
+        new, applied=fix_file(problem, f, src, couple)
+        if applied:
             open(ap,"w",encoding="utf-8").write(new)
     patch=subprocess.run(f"cd {repo_dir} && git diff",shell=True,capture_output=True,text=True).stdout
     sh(f"cd {repo_dir} && git checkout -q -f .")          # reset for next mode
